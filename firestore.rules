@@ -1,133 +1,96 @@
 rules_version = '2';
-
-// --- Firestore Rules ---
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // --- Helper Functions ---
     function isAuthenticated() {
       return request.auth != null;
     }
 
     function isAdmin() {
-      // Ensure the user document exists and isAdmin field is true
-      return isAuthenticated() && get(/databases/$(database)/documents/users/$(request.auth.uid)).exists() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
     }
 
-    // Users Collection Rules
+    function isParticipant(chatRoomDoc) {
+      return isAuthenticated() && request.auth.uid in chatRoomDoc.data.participants;
+    }
+
+    function isParticipantById(chatRoomId) {
+      return isAuthenticated() &&
+             exists(/databases/$(database)/documents/chat_rooms/$(chatRoomId)) &&
+             request.auth.uid in get(/databases/$(database)/documents/chat_rooms/$(chatRoomId)).data.participants;
+    }
+
+    // --- Users ---
     match /users/{userId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && request.auth.uid == userId;
-      // Allow update if authenticated and updating their own document.
-      // 1. Prevent non-admins from setting `isAdmin` to true (unless they are already an admin).
-      // 2. Allow updates to any other fields in their own document.
-      allow update: if isAuthenticated() && request.auth.uid == userId &&
-                      (!request.resource.data.isAdmin || isAdmin()); // Prevent non-admin from becoming admin, otherwise allow update
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow write: if request.auth.uid == userId || isAdmin();
+
+      match /user_chats/{chatRoomId} {
+        allow read: if isAuthenticated() && request.auth.uid == userId;
+        allow write: if false; // Only Cloud Functions
+      }
     }
 
-    // Announcements Collection Rules
-    match /announcements/{announcementId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
-    }
-
-    // Events Collection Rules
-    match /events/{eventId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAdmin();
-    }
-
-    // Troupes Collection Rules
-    match /troupes/{troupeId} {
-      allow read: if isAuthenticated();
-      allow create, delete: if isAdmin();
-      // Allow updates only for admins or for non-admin users changing only 'viewCount'
-      allow update: if isAdmin() || (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewCount']));
-    }
-
-    // Join Requests Collection Rules
+    // --- Join Requests ---
     match /joinRequests/{requestId} {
-      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
-      // Allow read if authenticated and it's their own request or they are an admin
-      allow read: if isAuthenticated() && (request.auth.uid == resource.data.userId || isAdmin());
+      allow create: if isAuthenticated();
+      allow read: if isAuthenticated() &&
+                   (isAdmin() || resource.data.userId == request.auth.uid);
       allow update, delete: if isAdmin();
     }
 
-    // Posts Collection Rules
+    // --- Announcements ---
+    match /announcements/{announcementId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // --- Events ---
+    match /events/{eventId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // --- Troupes ---
+    match /troupes/{troupeId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // --- Posts ---
     match /posts/{postId} {
       allow read: if isAuthenticated();
-
-      // Allow creating posts if admin or if authenticated user is assigned to the troupe/sub-troupe
-      allow create: if isAdmin() || (
-        isAuthenticated() &&
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedGroups is list && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedGroups.hasAny([request.resource.data.troupeId])) ||
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedSubgroups is list && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.assignedSubgroups.hasAny([request.resource.data.troupeId]))
-      );
-
-      // Allow updates if admin, author, or for specific reaction/commentCount fields
-      allow update: if isAdmin() ||
-                     (isAuthenticated() && request.auth.uid == resource.data.createdBy) ||
-                     (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions', 'reactedBy'])) ||
-                     (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentCount']));
-
-      // Allow deleting posts if admin or author
-      allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == resource.data.createdBy);
-
-      // Comments subcollection rules within posts
-      match /comments/{commentId} {
-        allow read: if isAuthenticated();
-        allow create: if isAuthenticated() && request.resource.data.createdBy == request.auth.uid;
-        // Allow update if comment author or for specific reaction fields
-        allow update: if isAuthenticated() && request.auth.uid == resource.data.createdBy ||
-                      (isAuthenticated() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions', 'reactedBy']));
-        // Allow delete if admin or comment author
-        allow delete: if isAdmin() || (isAuthenticated() && request.auth.uid == resource.data.createdBy);
-      }
+      allow write: if isAdmin();
     }
 
-    // Direct Messages Collection Rules
+    // --- Chat Rooms ---
     match /chat_rooms/{chatRoomId} {
-      // Allow read/update if authenticated and a participant in the chat room
-      allow read, update: if isAuthenticated() && request.auth.uid in resource.data.participants;
-      // Allow creating a chat room if authenticated, has exactly 2 participants, and the current user is one of them
-      allow create: if isAuthenticated() &&
-                       request.resource.data.participants is list &&
-                       request.resource.data.participants.size() == 2 &&
-                       request.auth.uid in request.resource.data.participants;
+      allow read: if isParticipant(resource);
+      allow write: if false;
 
-      // Messages subcollection within a chat room
+      // --- Messages inside chat room ---
       match /messages/{messageId} {
-        // Allow read if authenticated and part of the chat room
-        allow read: if isAuthenticated() && (chatRoomId.split('_')[0] == request.auth.uid || chatRoomId.split('_')[1] == request.auth.uid);
-        // Allow create if authenticated and sender is current user, and part of the chat room
-        allow create: if isAuthenticated() && request.resource.data.senderUid == request.auth.uid && (chatRoomId.split('_')[0] == request.auth.uid || chatRoomId.split('_')[1] == request.auth.uid);
-        allow update, delete: if false; // Messages are generally immutable
+        allow read: if isParticipantById(chatRoomId);
+        allow write: if false; // Only Cloud Functions
+      }
+
+      // --- Typing status inside chat room ---
+      match /typingStatus/{userId} {
+        allow read, write: if isParticipantById(chatRoomId) && request.auth.uid == userId;
       }
     }
 
-    // Default catch-all rule for Firestore: deny all other reads/writes
-    match /{document=**} {
-      allow read, write: if false;
-    }
-  }
-}
-
-// --- Firebase Storage Rules ---
-service firebase.storage {
-  match /b/{bucket}/o {
-    // General rule for Storage: Allow authenticated users to read any file.
-    allow read: if request.auth != null;
-
-    // Specific rule for profile images:
-    // Authenticated users can read and write files ONLY within their own {userId} folder
-    // inside the 'profile_images' directory.
-    match /profile_images/{userId}/{fileName} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+    // --- Reports ---
+    match /reports/{reportId} {
+      allow create: if isAuthenticated();
+      allow read, update, delete: if isAdmin();
     }
 
-    // Default rule for all other Storage paths:
-    // Deny all writes to any other path in storage unless explicitly allowed by another rule above.
-    match /{allPaths=**} {
-      allow write: if false;
+    // --- Redundant User Chats (clarified, still safe) ---
+    match /users/{userId}/user_chats/{chatRoomId} {
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      allow write: if false; // Only Cloud Functions
     }
   }
 }
